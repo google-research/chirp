@@ -21,13 +21,17 @@ import tempfile
 
 from chirp.data import filter_scrub_utils as fsu
 from chirp.tests import fake_dataset
+import jax
+import numpy as np
 import pandas as pd
 import tensorflow_datasets as tfds
+
 from absl.testing import absltest
+from absl.testing import parameterized
 
 
-class FilterScrubTest(absltest.TestCase):
-  """Used to factorize the common setup between different types of queries."""
+class DataProcessingTest(parameterized.TestCase):
+  """Used to factorize the common setup between data processing tests."""
 
   def setUp(self):
     super().setUp()
@@ -55,7 +59,7 @@ class FilterScrubTest(absltest.TestCase):
     shutil.rmtree(self.temp_dir)
 
 
-class NotInTests(FilterScrubTest):
+class NotInTests(DataProcessingTest):
 
   def test_filtering_ideal(self):
     """Ensure filtering produces expected results in nominal case."""
@@ -112,7 +116,101 @@ class NotInTests(FilterScrubTest):
           result_type='expand')
 
 
-class ScrubTest(FilterScrubTest):
+class SamplingTest(DataProcessingTest):
+
+  def setUp(self):
+    super().setUp()
+    fake_builder = fake_dataset.FakeDataset(data_dir=self.temp_dir)
+    fake_builder.download_and_prepare()
+
+    # The original version has 100 samples and ~ 11k classes, so chances
+    # are that we end up with 1 sample per class, which may be too edgy to
+    # test sampling functionalities
+    # (e.g. to test reproducibility given that only 1 recording can be sampled).
+    # Here, we load a reduced_version, with only 20 samples and 3 classes.
+    # This speeds up the computation, and also gives ~6 samples per class,
+    # which is good enough to test sampling.
+
+    self.fake_df = tfds.as_dataframe(fake_builder.as_dataset()['train_reduced'])
+
+  @parameterized.named_parameters(('array_field_test', 'label'),
+                                  ('str_field_test', 'country'))
+  def test_sample_recordings_per_group(self, group_key):
+    df = self.fake_df.copy()
+    # Testing for two fields whose values have different types.
+    seed = 0
+
+    all_groups = df[group_key].explode(group_key).unique()
+
+    # Compute the minimum number of samples per group
+    min_samples_per_group = min([
+        df[group_key].map(lambda values: group in values).sum()
+        for group in all_groups
+    ])
+
+    # Subsample such that we're sure all groups contain enough samples.
+    new_df = fsu.sample_recordings_per_group(df, min_samples_per_group,
+                                             group_key, seed)
+
+    # Ensure that we still have the same number of total groups.
+    self.assertEqual(
+        len(new_df[group_key].explode(group_key).unique()), len(all_groups))
+
+    # Ensure that if we try to sample more than existing, a ValueError is
+    # raised.
+    with self.assertRaises(ValueError):
+      fsu.sample_recordings_per_group(df, min_samples_per_group + 1, group_key,
+                                      seed)
+
+    # Ensure that each group has, at least, min_samples_per_group. Again, it
+    # could have more, because each sample may belong to multiple groups.
+    for group in all_groups:
+
+      def test_in(value, group=group):
+        return group in value
+
+      self.assertGreaterEqual(new_df[group_key].map(test_in).sum(),
+                              min_samples_per_group)
+
+    # Ensure that if allow_overlap=False, we retrieve exactly
+    # n_samples_per_group for each group, and that those samples only belong
+    # to a single group. Here we test with a small number (1) to make sure
+    # we'll be able to find 1 distinct samples for each group.
+    n_samples_per_group = 2
+    new_df = fsu.sample_recordings_per_group(
+        df, n_samples_per_group, group_key, seed, allow_overlap=False)
+    for group in all_groups:
+
+      def this_group_only(value,
+                          group=group,
+                          other_groups=set(all_groups).difference({group})):
+        if type(value) not in [list, np.ndarray]:
+          value = {value}
+        return group in value and not any(
+            [other in value for other in other_groups])
+
+      self.assertEqual(new_df[group_key].apply(this_group_only).sum(),
+                       n_samples_per_group)
+
+  def test_reproducibility(self):
+    """Ensure that we can repeat the exact same sampling."""
+    seed = 0
+    n_samples_per_group = 2
+    group_key = 'label'
+    first_df = fsu.sample_recordings_per_group(
+        self.fake_df, n_samples_per_group, group_key, seed, allow_overlap=False)
+    for _ in range(2):
+      self.assertEqual(
+          first_df.to_dict(),
+          fsu.sample_recordings_per_group(
+              self.fake_df,
+              n_samples_per_group,
+              group_key,
+              seed,
+              allow_overlap=False).to_dict())
+
+
+class ScrubTest(DataProcessingTest):
 
   def test_scrubbing_ideal(self):
     """Ensure scrubbing works as expected in nominal case."""
@@ -182,23 +280,12 @@ class ScrubTest(FilterScrubTest):
     self.assertTrue(self.fake_df.equals(df))
 
 
-class QueryTest(absltest.TestCase):
-
-  def setUp(self):
-    super().setUp()
-    # We define a toy dataframe that is easy to manually check
-    self.toy_df = pd.DataFrame({
-        'species_code': ['ostric2', 'ostric3', 'grerhe1'],
-        'Common name': ['Common Ostrich', 'Somali Ostrich', 'Greater Rhea'],
-        'bg_labels': [['ostric3', 'grerhe1'], ['ostric2', 'grerhe1'],
-                      ['ostric2', 'ostric3']],
-        'Country': ['Colombia', 'Australia', 'France'],
-    })
+class QueryTest(DataProcessingTest):
 
   def test_masking_query(self):
-    """Ensure masking queries (and completement) work as expected."""
+    """Ensure masking queries work as expected."""
 
-    # Test mask query and complement
+    # Test mask query
     mask_query = fsu.Query(
         op=fsu.MaskOp.IN, kwargs={
             'key': 'species_code',
@@ -206,18 +293,9 @@ class QueryTest(absltest.TestCase):
         })
     self.assertEqual(
         fsu.apply_query(self.toy_df, mask_query).tolist(), [True, False, False])
-    mask_query = fsu.Query(
-        op=fsu.MaskOp.IN,
-        complement=True,
-        kwargs={
-            'key': 'species_code',
-            'values': ['ostric2']
-        })
-    self.assertEqual(
-        fsu.apply_query(self.toy_df, mask_query).tolist(), [False, True, True])
 
-  def test_transform_query(self):
-    """Ensure transform queries work as expected."""
+  def test_scrub_query(self):
+    """Ensure scrubbing queries work as expected."""
 
     scrub_query = fsu.Query(
         op=fsu.TransformOp.SCRUB,
@@ -230,8 +308,10 @@ class QueryTest(absltest.TestCase):
     expected_df['bg_labels'] = [['ostric3', 'grerhe1'], ['grerhe1'],
                                 ['ostric3']]
     self.assertEqual(expected_df.to_dict(), df.to_dict())
-    # Ensure that setting complement to True for a transform query raises an
-    # error
+
+  def test_complement(self):
+    # Scrubbing does not remove any, samples. Therefore check that setting
+    # complement to True returns an empty df.
     scrub_query = fsu.Query(
         op=fsu.TransformOp.SCRUB,
         complement=True,
@@ -239,11 +319,60 @@ class QueryTest(absltest.TestCase):
             'key': 'bg_labels',
             'values': ['ostric2']
         })
+    self.assertEmpty(fsu.apply_query(self.toy_df, scrub_query))
+
+    # Test complemented filtering query
+    filter_query = fsu.Query(
+        op=fsu.TransformOp.FILTER,
+        complement=True,
+        kwargs={
+            'mask_op': fsu.MaskOp.IN,
+            'op_kwargs': {
+                'key': 'species_code',
+                'values': ['ostric2']
+            }
+        })
+    self.assertEqual(
+        fsu.apply_query(self.toy_df, filter_query).to_dict(),
+        self.toy_df.drop([0]).to_dict())
+
+  def test_sampling_query(self):
+
+    # Test when groups are specified
+    sample_recordings_query = fsu.Query(
+        fsu.TransformOp.SAMPLE_N_PER_GROUP, {
+            'group_key': 'bg_labels',
+            'samples_per_group': 2,
+            'groups': ['ostric3'],
+            'seed': 0
+        })
+    self.assertEqual(
+        fsu.apply_query(self.toy_df, sample_recordings_query).to_dict(),
+        self.toy_df.drop(1).to_dict())
+
+    # Test when groups are not specified.
+    sample_recordings_query = fsu.Query(fsu.TransformOp.SAMPLE_N_PER_GROUP, {
+        'group_key': 'bg_labels',
+        'samples_per_group': 2,
+        'seed': 0
+    })
+    self.assertEqual(
+        fsu.apply_query(self.toy_df, sample_recordings_query).to_dict(),
+        self.toy_df.to_dict())
+
+    # Test when specifying to many samples
     with self.assertRaises(ValueError):
-      fsu.apply_query(self.toy_df, scrub_query)
+      sample_recordings_query = fsu.Query(
+          fsu.TransformOp.SAMPLE_N_PER_GROUP, {
+              'group_key': 'bg_labels',
+              'samples_per_group': 3,
+              'groups': ['ostric3'],
+              'seed': 0
+          })
+      fsu.apply_query(self.toy_df, sample_recordings_query)
 
 
-class QuerySequenceTest(FilterScrubTest):
+class QuerySequenceTest(DataProcessingTest):
 
   def test_untargeted_filter_scrub(self):
     """Ensure that applying a QuerySequence (no masking specified) works."""
@@ -317,6 +446,21 @@ class QuerySequenceTest(FilterScrubTest):
     self.assertEqual(
         expected_df.sort_values('species_code').to_dict('list'),
         df.sort_values('species_code').to_dict('list'))
+
+  def test_nested_query_sequence(self):
+    filter_args = {
+        'mask_op': fsu.MaskOp.IN,
+        'op_kwargs': {
+            'key': 'species_code',
+            'values': ['ostric3', 'grerhe1']
+        }
+    }
+    filter_query = fsu.Query(op=fsu.TransformOp.FILTER, kwargs=filter_args)
+    query_sequence = fsu.QuerySequence(
+        [filter_query, fsu.QuerySequence([filter_query])])
+    self.assertEqual(
+        fsu.apply_sequence(self.toy_df, query_sequence).to_dict(),
+        fsu.apply_query(self.toy_df, filter_query).to_dict())
 
 
 if __name__ == '__main__':
