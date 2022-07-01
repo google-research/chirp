@@ -25,27 +25,17 @@ class FakeDataset(bird_taxonomy.BirdTaxonomy):
   def _split_generators(self, dl_manager):
     return {
         'train': self._generate_examples(100),
+        'train_reduced': self._generate_examples(20, True),
         'test': self._generate_examples(20),
     }
 
-  def _generate_examples(self, num_examples):
-
+  def _generate_examples(self, num_examples: int, reduced=False):
     for i in range(num_examples):
-      yield i, {
+      record = {
           'audio':
               np.random.uniform(-1.0, 0.99,
                                 self.info.features['audio'].shape).astype(
                                     np.float32),
-          'label':
-              np.random.choice(self.info.features['label'].names, size=[3]),
-          'bg_labels':
-              np.random.choice(self.info.features['bg_labels'].names, size=[2]),
-          'genus':
-              np.random.choice(self.info.features['genus'].names, size=[3]),
-          'family':
-              np.random.choice(self.info.features['family'].names, size=[3]),
-          'order':
-              np.random.choice(self.info.features['order'].names, size=[3]),
           'filename':
               'placeholder',
           'quality_score':
@@ -71,3 +61,39 @@ class FakeDataset(bird_taxonomy.BirdTaxonomy):
           'sound_type':
               np.random.choice(['call', 'song'])
       }
+      if reduced:
+        # using 20 samples with 3 classes speeds up tests, and ensures with high
+        # probability that we get > 1 sample per class, which is better suited
+        # to test sampling.
+        record.update({
+            'label':
+                np.random.choice(
+                    self.info.features['label'].names[:3], size=[1]),
+            'bg_labels':
+                np.random.choice(
+                    self.info.features['bg_labels'].names[:3], size=[2]),
+            'genus':
+                np.random.choice(
+                    self.info.features['genus'].names[:3], size=[3]),
+            'family':
+                np.random.choice(
+                    self.info.features['family'].names[:3], size=[3]),
+            'order':
+                np.random.choice(
+                    self.info.features['order'].names[:3], size=[3]),
+        })
+      else:
+        record.update({
+            'label':
+                np.random.choice(self.info.features['label'].names, size=[3]),
+            'bg_labels':
+                np.random.choice(
+                    self.info.features['bg_labels'].names, size=[2]),
+            'genus':
+                np.random.choice(self.info.features['genus'].names, size=[3]),
+            'family':
+                np.random.choice(self.info.features['family'].names, size=[3]),
+            'order':
+                np.random.choice(self.info.features['order'].names, size=[3]),
+        })
+      yield i, record
