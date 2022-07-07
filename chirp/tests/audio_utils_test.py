@@ -19,10 +19,8 @@ from chirp import audio_utils
 from jax import numpy as jnp
 from jax import random
 from jax import scipy as jsp
-from jax.experimental import jax2tf
 from librosa.core import spectrum
 import numpy as np
-import tensorflow as tf
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -72,40 +70,6 @@ class AudioUtilsTest(parameterized.TestCase):
     _, istft_tf = audio_utils.istft(self.spectrogram, **kwargs)
 
     np.testing.assert_allclose(istft_tf, istft_jax, rtol=1e-2, atol=1e-3)
-
-  def test_tflite_melspec(self):
-    # Demonstrate TFLite export of the melspec computation.
-
-    # Export a TFLite model from the melspec model function.
-    tf_predict = tf.function(
-        jax2tf.convert(
-            lambda audio: audio_utils.stft(audio)[2], enable_xla=False),
-        input_signature=[
-            tf.TensorSpec(
-                shape=self.audio.shape, dtype=tf.float32, name="input")
-        ],
-        autograph=False)
-    converter = tf.lite.TFLiteConverter.from_concrete_functions(
-        [tf_predict.get_concrete_function()], tf_predict)
-
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS,  # enable TensorFlow Lite ops.
-        tf.lite.OpsSet.SELECT_TF_OPS  # enable TensorFlow ops.
-    ]
-    tflite_float_model = converter.convert()
-
-    # Use the converted TFLite model.
-    interpreter = tf.lite.Interpreter(model_content=tflite_float_model)
-    interpreter.allocate_tensors()
-    input_tensor = interpreter.get_input_details()[0]
-    output_tensor = interpreter.get_output_details()[0]
-    interpreter.set_tensor(input_tensor["index"], self.audio)
-    interpreter.invoke()
-    output_array = interpreter.get_tensor(output_tensor["index"])
-
-    # Check approximate agreement of TFLite output with the jax function.
-    melspec_jax = audio_utils.stft(self.audio)[2]
-    np.testing.assert_allclose(output_array, melspec_jax, atol=1e-6)
 
   def test_pcen(self):
     gain = 0.5
