@@ -785,11 +785,12 @@ def retrieve_recording_metadata(taxonomy_info: pd.DataFrame,
       zip(taxonomy_info['xeno_canto_query'], taxonomy_info['species_code']))
 
   def _to_species_codes(background_species):
-    return [
-        xeno_canto_query_to_species_code[q]
-        for q in background_species
-        if q in xeno_canto_query_to_species_code
-    ]
+    result = []
+    for q in background_species:
+      for s in xeno_canto_query_to_species_code:
+        if q in s.split(','):
+          result.append(xeno_canto_query_to_species_code[s])
+    return result
 
   taxonomy_info['bg_species_codes'] = taxonomy_info['species_code'].map({
       code: [_to_species_codes(info.background_species) for info in metadata
