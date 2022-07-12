@@ -23,11 +23,12 @@ from chirp.data import filter_scrub_utils as fsu
 from chirp.tests import fake_dataset
 import pandas as pd
 import tensorflow_datasets as tfds
+
 from absl.testing import absltest
 
 
-class FilterScrubTest(absltest.TestCase):
-  """Used to factorize the common setup between different types of queries."""
+class DataProcessingTest(absltest.TestCase):
+  """Used to factorize the common setup between data processing tests."""
 
   def setUp(self):
     super().setUp()
@@ -48,6 +49,7 @@ class FilterScrubTest(absltest.TestCase):
     # Using `tempdir` instead and manually deleting the folder after test.
     fake_builder = fake_dataset.FakeDataset(data_dir=self.temp_dir)
     fake_builder.download_and_prepare()
+    self.fake_info = fake_builder.info
     self.fake_df = tfds.as_dataframe(fake_builder.as_dataset()['train'])
 
   def tearDown(self):
@@ -55,7 +57,7 @@ class FilterScrubTest(absltest.TestCase):
     shutil.rmtree(self.temp_dir)
 
 
-class NotInTests(FilterScrubTest):
+class NotInTests(DataProcessingTest):
 
   def test_filtering_ideal(self):
     """Ensure filtering produces expected results in nominal case."""
@@ -112,7 +114,27 @@ class NotInTests(FilterScrubTest):
           result_type='expand')
 
 
-class ScrubTest(FilterScrubTest):
+class SamplingTest(DataProcessingTest):
+
+  def test_sampling_under_constraints(self):
+
+    toy_df = pd.DataFrame({
+        'species_code': ['O', 'A', 'B', 'A', 'O', 'O'],
+        'bg_species_codes': [['O'], ['O', 'B'], ['A'], [], ['A'], ['A', 'B']],
+    })
+    species_of_interest = ['A', 'B']
+    target_fg = {k: 1 for k in species_of_interest}
+    target_bg = {k: 2 for k in species_of_interest}
+    query = fsu.Query(fsu.TransformOp.SAMPLE_UNDER_CONSTRAINTS, {
+        'target_fg': target_fg,
+        'target_bg': target_bg
+    })
+    df = fsu.apply_query(toy_df, query)
+    expected_df = toy_df.drop([0, 3, 4])
+    self.assertEqual(df.to_dict(), expected_df.to_dict())
+
+
+class ScrubTest(DataProcessingTest):
 
   def test_scrubbing_ideal(self):
     """Ensure scrubbing works as expected in nominal case."""
@@ -182,23 +204,10 @@ class ScrubTest(FilterScrubTest):
     self.assertTrue(self.fake_df.equals(df))
 
 
-class QueryTest(absltest.TestCase):
+class QueryTest(DataProcessingTest):
 
-  def setUp(self):
-    super().setUp()
-    # We define a toy dataframe that is easy to manually check
-    self.toy_df = pd.DataFrame({
-        'species_code': ['ostric2', 'ostric3', 'grerhe1'],
-        'Common name': ['Common Ostrich', 'Somali Ostrich', 'Greater Rhea'],
-        'bg_labels': [['ostric3', 'grerhe1'], ['ostric2', 'grerhe1'],
-                      ['ostric2', 'ostric3']],
-        'Country': ['Colombia', 'Australia', 'France'],
-    })
+  def test_in_query(self):
 
-  def test_masking_query(self):
-    """Ensure masking queries (and completement) work as expected."""
-
-    # Test mask query and complement
     mask_query = fsu.Query(
         op=fsu.MaskOp.IN, kwargs={
             'key': 'species_code',
@@ -206,18 +215,29 @@ class QueryTest(absltest.TestCase):
         })
     self.assertEqual(
         fsu.apply_query(self.toy_df, mask_query).tolist(), [True, False, False])
+
+  def test_contains_query(self):
+
     mask_query = fsu.Query(
-        op=fsu.MaskOp.IN,
-        complement=True,
+        op=fsu.MaskOp.CONTAINS_ANY,
         kwargs={
-            'key': 'species_code',
+            'key': 'bg_labels',
             'values': ['ostric2']
         })
     self.assertEqual(
         fsu.apply_query(self.toy_df, mask_query).tolist(), [False, True, True])
 
-  def test_transform_query(self):
-    """Ensure transform queries work as expected."""
+    mask_query = fsu.Query(
+        op=fsu.MaskOp.CONTAINS_NO,
+        kwargs={
+            'key': 'bg_labels',
+            'values': ['ostric1', 'ostric2']
+        })
+    self.assertEqual(
+        fsu.apply_query(self.toy_df, mask_query).tolist(), [True, False, False])
+
+  def test_scrub_query(self):
+    """Ensure scrubbing queries work as expected."""
 
     scrub_query = fsu.Query(
         op=fsu.TransformOp.SCRUB,
@@ -230,20 +250,128 @@ class QueryTest(absltest.TestCase):
     expected_df['bg_labels'] = [['ostric3', 'grerhe1'], ['grerhe1'],
                                 ['ostric3']]
     self.assertEqual(expected_df.to_dict(), df.to_dict())
-    # Ensure that setting complement to True for a transform query raises an
-    # error
+
+  def test_complemented_query(self):
+    # Scrubbing does not remove any, samples. Therefore check that setting
+    # complement to True returns an empty df.
     scrub_query = fsu.Query(
         op=fsu.TransformOp.SCRUB,
-        complement=True,
         kwargs={
             'key': 'bg_labels',
             'values': ['ostric2']
         })
-    with self.assertRaises(ValueError):
-      fsu.apply_query(self.toy_df, scrub_query)
+    new_df = fsu.apply_complement(self.toy_df, fsu.QueryComplement(scrub_query))
+    self.assertEmpty(new_df)
+
+    # Test complemented filtering query
+    filter_query = fsu.Query(
+        op=fsu.TransformOp.FILTER,
+        kwargs={
+            'mask_op': fsu.MaskOp.IN,
+            'op_kwargs': {
+                'key': 'species_code',
+                'values': ['ostric2']
+            }
+        })
+    self.assertEqual(
+        fsu.apply_complement(self.toy_df,
+                             fsu.QueryComplement(filter_query)).to_dict(),
+        self.toy_df.drop([0]).to_dict())
 
 
-class QuerySequenceTest(FilterScrubTest):
+class QueryParallelTest(DataProcessingTest):
+
+  def test_merge_add(self):
+
+    # Add is mostly useful to simulate OR operations on masking queries
+    mask_query_1 = fsu.Query(fsu.MaskOp.IN, {
+        'key': 'Country',
+        'values': ['Colombia']
+    })
+    mask_query_2 = fsu.Query(fsu.MaskOp.IN, {
+        'key': 'species_code',
+        'values': ['grerhe1']
+    })
+
+    query_parallel = fsu.QueryParallel([mask_query_1, mask_query_2],
+                                       fsu.MergeStrategy.OR)
+    mask = fsu.apply_parallel(self.toy_df, query_parallel)
+    self.assertEqual(mask.tolist(), [True, False, True])
+    self.assertIn('Colombia', self.toy_df[mask]['Country'].tolist())
+    self.assertIn('grerhe1', self.toy_df[mask]['species_code'].tolist())
+
+    # Ensure an error is raised if any element is not a boolean Series.
+    with self.assertRaises(RuntimeError):
+      fsu.or_series([
+          self.toy_df['species_code'], self.toy_df['species_code'] == 'ostric2'
+      ])
+
+    # Ensure an error is raised if any element is not a boolean Series.
+    with self.assertRaises(RuntimeError):
+      fsu.or_series([
+          self.toy_df.drop(0)['species_code'] == 'ostric2',
+          self.toy_df['species_code'] == 'ostric2'
+      ])
+
+  def test_merge_concat_no_duplicates(self):
+
+    # Add is mostly useful to simulate OR operations on masking queries
+    filter_query_1 = fsu.Query(
+        fsu.TransformOp.FILTER, {
+            'mask_op': fsu.MaskOp.IN,
+            'op_kwargs': {
+                'key': 'Country',
+                'values': ['Colombia']
+            }
+        })
+    filter_query_2 = fsu.Query(
+        fsu.TransformOp.FILTER, {
+            'mask_op': fsu.MaskOp.IN,
+            'op_kwargs': {
+                'key': 'Country',
+                'values': ['Colombia', 'Australia']
+            }
+        })
+    scrub_query = fsu.Query(fsu.TransformOp.SCRUB, {
+        'key': 'bg_labels',
+        'values': ['ostric3']
+    })
+
+    # First recording will be selected by both queries (i.e. dupplicate). The
+    # following ensures it only appears once in the result when using
+    # CONCAT_NO_DUPLICATES
+    query_parallel = fsu.QueryParallel([filter_query_1, filter_query_2],
+                                       fsu.MergeStrategy.CONCAT_NO_DUPLICATES)
+    self.assertTrue(
+        fsu.apply_parallel(self.toy_df,
+                           query_parallel).equals(self.toy_df.drop(2)))
+
+    # In the following, we also apply scrubbing in the second Query. This
+    # scrubbing will modify the first recording, and therefore it shouldn't be
+    # counted as a duplicate anymore. In the final df, we should find two
+    # versions of the first recording (the original, and the scrubbed one).
+    query_parallel = fsu.QueryParallel(
+        [filter_query_1,
+         fsu.QuerySequence([filter_query_2, scrub_query])],
+        fsu.MergeStrategy.CONCAT_NO_DUPLICATES)
+    scrubbed_r0 = self.toy_df.copy().loc[0]
+    scrubbed_r0['bg_labels'] = ['grerhe1']
+    # Here we don't use assertEqual with the .to_dict() because .to_dict()
+    # automatically removes duplicate indexes, making it impossible to know
+    # if duplicates were removed because of our merging strategy or because
+    # of .to_dict().
+    self.assertTrue(
+        fsu.apply_parallel(self.toy_df, query_parallel).equals(
+            self.toy_df.loc[[0]].append([scrubbed_r0, self.toy_df.loc[1]])))
+
+    # Ensure the concatenation raises an error if the two dataframes don't have
+    # the exact same columns.
+    with self.assertRaises(RuntimeError):
+      fsu.concat_no_duplicates(
+          [self.toy_df, self.toy_df[['species_code', 'bg_labels']]])
+
+
+class QuerySequenceTest(DataProcessingTest):
 
   def test_untargeted_filter_scrub(self):
     """Ensure that applying a QuerySequence (no masking specified) works."""
@@ -317,6 +445,52 @@ class QuerySequenceTest(FilterScrubTest):
     self.assertEqual(
         expected_df.sort_values('species_code').to_dict('list'),
         df.sort_values('species_code').to_dict('list'))
+
+  def test_nested_query_sequence(self):
+    filter_args = {
+        'mask_op': fsu.MaskOp.IN,
+        'op_kwargs': {
+            'key': 'species_code',
+            'values': ['ostric3', 'grerhe1']
+        }
+    }
+    filter_query = fsu.Query(fsu.TransformOp.FILTER, filter_args)
+    mask_query = fsu.Query(fsu.MaskOp.IN, {
+        'key': 'species_code',
+        'values': ['grerhe1']
+    })
+    scrub_query = fsu.Query(fsu.TransformOp.SCRUB, {
+        'key': 'bg_labels',
+        'values': ['ostric2']
+    })
+    equivalent_queries = [
+        fsu.QuerySequence(
+            [filter_query,
+             fsu.QuerySequence([scrub_query], mask_query)]),
+        fsu.QuerySequence([
+            filter_query,
+            fsu.QuerySequence([filter_query]),
+            fsu.QuerySequence([scrub_query], mask_query)
+        ],),
+        fsu.QuerySequence([
+            fsu.QuerySequence([filter_query]), filter_query,
+            fsu.QuerySequence([scrub_query], mask_query)
+        ],),
+        fsu.QuerySequence([
+            fsu.QuerySequence([]), filter_query,
+            fsu.QuerySequence([scrub_query], mask_query)
+        ],),
+        fsu.QuerySequence([
+            filter_query,
+            fsu.QuerySequence([filter_query, scrub_query], mask_query)
+        ],)
+    ]
+    expected_df = self.toy_df.drop(0)
+    expected_df['bg_labels'] = [['ostric2', 'grerhe1'], ['ostric3']]
+    for query_sequence in equivalent_queries:
+      self.assertEqual(
+          expected_df.to_dict(),
+          fsu.apply_sequence(self.toy_df, query_sequence).to_dict())
 
 
 if __name__ == '__main__':
